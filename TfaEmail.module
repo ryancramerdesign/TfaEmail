@@ -1,0 +1,247 @@
+<?php namespace ProcessWire;
+
+/**
+ * TfaEmail - ProcessWire two factor authentication email based implementation
+ *
+ * @property string $emailFrom
+ * @method bool emailCode($email, $code)
+ * 
+ */
+class TfaEmail extends Tfa implements Module, ConfigurableModule {
+	
+	const defaultEmailFrom = 'noreply@processwire.com';
+
+	/**
+	 * Construct
+	 * 
+	 */
+	public function __construct() {
+		parent::__construct();
+		$this->set('codeLength', 6); 
+		$this->set('codeExpire', 180);
+		$this->set('emailFrom', self::defaultEmailFrom); 
+	}
+
+	/**
+	 * Is TFA enabled for given user?
+	 *
+	 * @param User $user
+	 * @param array $settings
+	 * @return bool
+	 *
+	 */
+	public function enabledForUser(User $user, array $settings) {
+		$enabled = !empty($settings['conf_email']) && $settings['conf_email'] === $settings['code_email'];
+		return $enabled;
+	}
+	
+	/**
+	 * Start two-factor authentication for User
+	 *
+	 * @param User $user
+	 * @param array $settings
+	 * @return bool True on success, false on fail
+	 *
+	 */
+	public function startUser(User $user, array $settings) {
+	
+		// generate code
+		$code = $this->generateCode();
+	
+		// email the code to the user
+		$email = $settings['code_email'];
+		if(empty($email)) return false;
+		if(!$this->emailCode($email, $code)) return false;
+		
+		return parent::startUser($user, $settings);
+	}
+
+	/**
+	 * Send the authentication code to an email address
+	 * 
+	 * @param string $email
+	 * @param string $code
+	 * @return bool
+	 * 
+	 */
+	public function ___emailCode($email, $code) {
+		
+		$httpHost = $this->wire('config')->httpHost;
+		$subject = $this->_('Authentication Code') . ' - ' . $httpHost;
+		$body = sprintf($this->_('Your two-factor authentication code is: %s'), $code);
+		$from = $this->emailFrom;
+		
+		if(empty($from)) $from = self::defaultEmailFrom;
+		list($name, $host) = explode('@', $from);
+		if(strtolower($host) == 'processwire.com') $from = "$name@$httpHost"; // substitute actual http host
+		
+		$message = $this->wire('mail')->new()
+			->to($email)
+			->from($from)
+			->subject($subject)
+			->body($body);
+		
+		if($message->send()) {
+			$this->warning($this->_('A code has been sent to you - please find it and enter it on this screen.'));
+			return true;
+		} else {
+			$this->error($this->_('Unable to send email due to possible email configuration error.'));
+			return false;
+		}
+	}
+
+	/**
+	 * Generate a random auth code and remembr in session
+	 * 
+	 * @return string
+	 * @throws WireException
+	 * 
+	 */
+	protected function generateCode() {
+		
+		$pass = new Password();
+		$this->wire($pass);
+		$length = $this->codeLength > 0 ? $this->codeLength : 6;
+		$code = $pass->randomDigits($length);
+		if(strlen($code) !== $length) throw new WireException('Error generating code');
+		
+		// remember code in session
+		$codes = $this->sessionGet('codes', array());
+		if(count($codes) > 2) $codes = array_slice($codes, -2); // max 3 codes at once
+		$codes[] = array(
+			'code' => $code,
+			'expires' => time() + $this->codeExpire,
+		);
+		$this->sessionSet('codes', $codes);
+		
+		return $code;
+	}
+	
+	/**
+	 * Return true if code is valid or false if not
+	 *
+	 * @param User $user
+	 * @param string|int $code
+	 * @param array $settings
+	 * @return bool|int
+	 *
+	 */
+	public function isValidUserCode(User $user, $code, array $settings) {
+
+		if($user || $settings) {} // ignore
+		if(strlen($code) !== $this->codeLength) return false;
+
+		$codes = $this->sessionGet('codes', array());
+		$valid = false;
+
+		foreach($codes as $key => $info) {
+			if($info['code'] !== $code) continue;
+			if(time() >= $info['expires']) {
+				// code is expired
+				$valid = 0;
+			} else {
+				// code is valid
+				$valid = true;
+			}
+			break;
+		}
+
+		return $valid;
+	}
+	
+	/**
+	 * Get fields needed for a user to configure and confirm TFA from their user profile
+	 *
+	 * @param User $user
+	 * @param InputfieldWrapper $fieldset
+	 * @param array $settings
+	 *
+	 */
+	public function ___getUserSettingsInputfields(User $user, InputfieldWrapper $fieldset, $settings) {
+		parent::___getUserSettingsInputfields($user, $fieldset, $settings);
+		
+		// check if the value of the field has changed
+		if(empty($settings['code_email'])) {
+			// not yet entered, nothing to do yet
+			$fieldset->new('email', 'code_email', $this->_('Email address to send code to'))
+				->icon('envelope')
+				->notes(
+					$this->_('**Using SMS:** Most mobile telephony providers support free email-to-SMS by using a special email address that has your phone number in it.') . ' ' .
+					$this->_('Search Google for “email to SMS your-provider” to find out your SMS email address.')
+				); 
+				
+		} else {
+			// add a confirmation code field
+			$fieldset->new('text', 'conf_code', $this->_('Confirm authentication code'))
+				->icon('lock')
+				->notes($this->_('To re-send code, leave blank and save.')); 
+		}
+	}
+	
+	/**
+	 * Called when the user config fieldset has been processed but before settings have been saved
+	 *
+	 * @param User $user
+	 * @param InputfieldWrapper $fieldset
+	 * @param array $settings Associative array of new/current settings after processing
+	 * @param array $settingsPrev Associative array of previous settings
+	 * @return array Return $newSettings array (modified as needed)
+	 *
+	 */
+	public function ___processUserSettingsInputfields(User $user, InputfieldWrapper $fieldset, $settings, $settingsPrev) {
+		if($fieldset && $settingsPrev) {} // ignore
+		$settings = parent::___processUserSettingsInputfields($user, $fieldset, $settings, $settingsPrev); 
+		
+		if($settings['conf_code']) { 
+			$valid = $this->isValidUserCode($user, $settings['conf_code'], $settings);
+			if($valid) {
+				$settings['conf_email'] = $settings['code_email'];
+				$this->message($this->_('Thank you, your email address has been confirmed'));
+			} else if($valid === 0) {
+				$this->error($this->_('You entered an expired code.'));
+			} else {
+				$this->error($this->_('Invalid confirmation code, please try again')); 
+			}
+			$settings['conf_code'] = '';
+		} else if($settings['code_email'] && $settings['conf_email'] != $settings['code_email']) {
+			$code = $this->generateCode();
+			$this->emailCode($settings['code_email'], $code);
+		}
+
+		return $settings;
+	}
+	
+	/**
+	 * Get default/blank user settings
+	 *
+	 * @param User $user
+	 * @return array
+	 *
+	 */
+	protected function getDefaultUserSettings(User $user) {
+		if($user) {}
+		return array(
+			'code_email' => '',
+			'conf_email' => '',	
+			'conf_code' => '', 
+		);
+	}
+
+	/**
+	 * Module configuration
+	 *
+	 * @param InputfieldWrapper $inputfields
+	 *
+	 */
+	public function getModuleConfigInputfields(InputfieldWrapper $inputfields) {
+		$inputfields->new('integer', 'codeLength', $this->_('Authentication code length'))
+			->val($this->codeLength)
+			->columnWidth(50);
+		$inputfields->new('integer', 'codeExpire', $this->_('Code expiration (seconds)'))
+			->val($this->codeExpire)
+			->columnWidth(50);
+		$inputfields->new('email', 'emailFrom', $this->_('From address for emailed codes'))
+			->val($this->emailFrom)
+			->notes($this->_('Placeholder “processwire.com” is automatically replaced with actual HTTP host at runtime.'));
+	}
+}

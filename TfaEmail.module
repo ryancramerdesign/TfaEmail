@@ -4,7 +4,14 @@
  * TfaEmail - ProcessWire two factor authentication email based implementation
  *
  * @property string $emailFrom
+ * @property string $wireMailer
+ * @property int $codeLength
+ * @property int $codeExpire
+ * @property string $emailField Email field name when custom option not used
+ * 
  * @method bool emailCode($email, $code)
+ * @method void populateEmailMessage(WireMail $mail, $email, $code)
+ * @method string generateRandomCode($length = 6)
  * 
  */
 class TfaEmail extends Tfa implements Module, ConfigurableModule {
@@ -20,6 +27,38 @@ class TfaEmail extends Tfa implements Module, ConfigurableModule {
 		$this->set('codeLength', 6); 
 		$this->set('codeExpire', 180);
 		$this->set('emailFrom', self::defaultEmailFrom); 
+		$this->set('wireMailer', '');
+		$this->set('emailField', 'email'); // email field name when when custom option not used
+	}
+	
+	/**
+	 * Get translated Tfa type short name
+	 *
+	 * @return string
+	 *
+	 */
+	public function getTfaTypeName() {
+		return $this->_('Email'); 
+	}
+
+	/**
+	 * Get translated Tfa type title
+	 *
+	 * @return string
+	 *
+	 */
+	public function getTfaTypeTitle() {
+		return $this->_('Email two-factor authentication');
+	}
+
+	/**
+	 * Get translated Tfa type summary
+	 *
+	 * @return string
+	 *
+	 */
+	public function getTfaTypeSummary() {
+		return $this->_('Sends you a random code by email that you enter at login.');
 	}
 
 	/**
@@ -31,8 +70,41 @@ class TfaEmail extends Tfa implements Module, ConfigurableModule {
 	 *
 	 */
 	public function enabledForUser(User $user, array $settings) {
+		if(empty($settings['conf_email'])) return false;
 		$enabled = !empty($settings['conf_email']) && $settings['conf_email'] === $settings['code_email'];
 		return $enabled;
+	}
+
+	/**
+	 * Does this TFA module support automatic enable?
+	 *
+	 * @param User $user Specify user to also confirm it is supported for given user.
+	 *   Omit to test if the module supports it in general.
+	 * @return bool
+	 *
+	 */
+	public function autoEnableSupported(User $user = null) {
+		if($user && !$user->get($this->emailField)) return false; // no email to use
+		return true;
+	}
+
+	/**
+	 * Programmatically enable this TFA module for given user, using their current email field
+	 *
+	 * @param User $user
+	 * @param array $settings For internal use, should only be specified on a parent::setEnabledForUser() call.
+	 * @throws WireException
+	 *
+	 */
+	public function autoEnableUser(User $user, array $settings = array()) {
+		if(!strlen($user->get($this->emailField))) {
+			throw new WireException("User email address required to auto-enable");
+		}
+		$settings = $this->getUserSettings($user);
+		// note that 'e' means “user’s current email address in email field”
+		$settings['conf_email'] = 'e';
+		$settings['code_email'] = 'e';
+		parent::autoEnableUser($user, $settings);
 	}
 	
 	/**
@@ -46,10 +118,11 @@ class TfaEmail extends Tfa implements Module, ConfigurableModule {
 	public function startUser(User $user, array $settings) {
 	
 		// generate code
-		$code = $this->generateCode();
+		$code = $this->getNewCode();
 	
 		// email the code to the user
 		$email = $settings['code_email'];
+		if($email === 'e') $email = $user->get($this->emailField);
 		if(empty($email)) return false;
 		if(!$this->emailCode($email, $code)) return false;
 		
@@ -66,23 +139,15 @@ class TfaEmail extends Tfa implements Module, ConfigurableModule {
 	 */
 	public function ___emailCode($email, $code) {
 		
-		$httpHost = $this->wire('config')->httpHost;
-		$subject = $this->_('Authentication Code') . ' - ' . $httpHost;
-		$body = sprintf($this->_('Your two-factor authentication code is: %s'), $code);
-		$from = $this->emailFrom;
+		$mail = $this->getMailer();		
 		
-		if(empty($from)) $from = self::defaultEmailFrom;
-		list($name, $host) = explode('@', $from);
-		if(strtolower($host) == 'processwire.com') $from = "$name@$httpHost"; // substitute actual http host
+		$this->populateEmailMessage($mail, $email, $code); 
 		
-		$message = $this->wire('mail')->new()
-			->to($email)
-			->from($from)
-			->subject($subject)
-			->body($body);
-		
-		if($message->send()) {
-			$this->warning($this->_('A code has been sent to you - please find it and enter it on this screen.'));
+		if($mail->send()) {
+			$this->warning(sprintf(
+				$this->_('A code has been sent to you by email at %s - please find it and enter it on this screen.'), 
+				$this->disguiseEmail($email)
+			));
 			return true;
 		} else {
 			$this->error($this->_('Unable to send email due to possible email configuration error.'));
@@ -91,18 +156,60 @@ class TfaEmail extends Tfa implements Module, ConfigurableModule {
 	}
 
 	/**
-	 * Generate a random auth code and remembr in session
+	 * Populate WireMail with to, from, subject and body
+	 * 
+	 * @param WireMail $message
+	 * @param string $email
+	 * @param string $code
+	 * 
+	 */
+	public function ___populateEmailMessage(WireMail $message, $email, $code) {
+		
+		$httpHost = $this->wire('config')->httpHost;
+		$subject = $this->_('Authentication Code') . ' - ' . $httpHost;
+		$from = $this->emailFrom;
+		$body = sprintf($this->_('Your two-factor authentication code is: %s'), $code);
+
+		if(strpos($body, 'Your two-factor') === 0) {
+			// if the above one is not already translated, use this one instead:
+			$body = sprintf($this->_('%s is your two-factor authentication code'), $code);
+		}
+
+		if(empty($from)) $from = self::defaultEmailFrom;
+		list($name, $host) = explode('@', $from);
+		if(strtolower($host) == 'processwire.com' && ($name != 'newsletter' && $name != 'ryan')) {
+			$from = "$name@$httpHost"; // substitute actual http host
+		}
+		
+		$message->to($email)->from($from)->subject($subject)->body($body);
+	}
+
+	/**
+	 * Get WireMail instance
+	 * 
+	 * @return WireMail
+	 * 
+	 */
+	public function getMailer() {
+		$mailer = null;
+		$mail = $this->wire()->mail;	
+		if($this->wireMailer && $mail) $mailer = $mail->new(array('module' => $this->wireMailer));
+		if(!$mailer && $mail) $mailer = $mail->new();
+		if(!$mailer) $mailer = wireMail();
+		return $mailer;
+	}
+
+	/**
+	 * Get a new random auth code and remember in session
 	 * 
 	 * @return string
 	 * @throws WireException
 	 * 
 	 */
-	protected function generateCode() {
+	protected function getNewCode() {
 		
-		$pass = new Password();
-		$this->wire($pass);
 		$length = $this->codeLength > 0 ? $this->codeLength : 6;
-		$code = $pass->randomDigits($length);
+		$code = $this->generateRandomCode($length);
 		if(strlen($code) !== $length) throw new WireException('Error generating code');
 		
 		// remember code in session
@@ -116,6 +223,51 @@ class TfaEmail extends Tfa implements Module, ConfigurableModule {
 		
 		return $code;
 	}
+
+	/**
+	 * Generate a random auth code
+	 * 
+	 * @param int $length
+	 * @return string
+	 * 
+	 */
+	protected function ___generateRandomCode($length = 6) {
+		$rand = new WireRandom();
+		$this->wire($rand);
+		return $rand->numeric($length);
+	}
+
+	/**
+	 * Disguise an email address so that only the owner would recognize it
+	 * 
+	 * @param string $email
+	 * @return string
+	 * 
+	 */
+	protected function disguiseEmail($email) {
+		list($a, $b) = explode('@', $email);
+		if(strlen($a) > 1) {
+			$as = str_repeat('*', strlen($a) - 1);
+			$a = substr($a, 0, 1) . $as;
+		} else {
+			$a = '*';
+		}
+		if(strpos($b, '.')) {
+			$bb = explode('.', $b);
+			$c = '.' . array_pop($bb);
+			$b = implode('.', $bb);
+		} else {
+			$c = '';
+		}
+		if(strlen($b) > 1) {
+			$bs = str_repeat('*', strlen($b) - 1);
+			$b = $bs . substr($b, -1);
+		} else {
+			$b = '*';
+		}
+		return "$a@$b$c";
+	}
+		
 	
 	/**
 	 * Return true if code is valid or false if not
@@ -163,21 +315,59 @@ class TfaEmail extends Tfa implements Module, ConfigurableModule {
 		// check if the value of the field has changed
 		if(empty($settings['code_email'])) {
 			// not yet entered, nothing to do yet
-			$fieldset->new('email', 'code_email', $this->_('Email address to send code to'))
-				->icon('envelope')
-				->notes(
-					$this->_('**Using SMS:** Most mobile telephony providers support free email-to-SMS by using a special email address that has your phone number in it.') . ' ' .
-					$this->_('Search Google for “email to SMS your-provider” to find out your SMS email address.')
-				); 
-				
+			$userEmail = $user->get($this->emailField);
+			if($userEmail) {
+				/** @var InputfieldRadios $f */
+				$f = $this->wire()->modules->get('InputfieldRadios');
+				$f->attr('name', 'email_type');
+				$f->label = $this->_('What email do you want to use?');
+				$f->addOption('current', sprintf($this->_('Current email address (%s)'), $userEmail));
+				$f->addOption('custom', $this->_('Specify a different email'));
+				$f->val('current');
+				$f->icon('envelope');
+				$fieldset->add($f);
+			}
+		
+			/** @var InputfieldEmail $f */
+			$f = $this->wire()->modules->get('InputfieldEmail');
+			$f->attr('name', 'code_email');
+			$f->icon = 'envelope';
+			if($userEmail) {
+				$f->label = $this->_('To use a different email please specify it here');
+				$f->showIf = '_tfa_email_type=custom';
+			} else {
+				$f->label = $this->_('Email address to send code to');
+			}
+			$fieldset->add($f);
+			$fieldset->description = $this->_('Review and complete the field(s) below, then click “submit” and a confirmation code will be emailed to you.'); 
+			
 		} else {
 			// add a confirmation code field
 			$fieldset->new('text', 'conf_code', $this->_('Confirm authentication code'))
 				->icon('lock')
+				->attr('autofocus', 'autofocus')
 				->notes($this->_('To re-send code, leave blank and save.')); 
 		}
 	}
-	
+
+	/**
+	 * Get Inputfields when user has this Tfa module enabled
+	 * 
+	 * @param User $user
+	 * @param InputfieldWrapper $fieldset
+	 * @param array $settings
+	 * 
+	 */
+	public function ___getUserEnabledInputfields(User $user, InputfieldWrapper $fieldset, $settings) {
+		parent::___getUserEnabledInputfields($user, $fieldset, $settings);
+		$userEmail = $user->get($this->emailField);
+		$email = $settings['conf_email'] === 'e' ? $userEmail : $settings['conf_email'];
+		$fieldset->notes = trim(
+			$fieldset->notes . "\n" .
+			sprintf($this->_('Your 2-factor email is: %s'), $email)
+		);
+	}
+
 	/**
 	 * Called when the user config fieldset has been processed but before settings have been saved
 	 *
@@ -189,25 +379,42 @@ class TfaEmail extends Tfa implements Module, ConfigurableModule {
 	 *
 	 */
 	public function ___processUserSettingsInputfields(User $user, InputfieldWrapper $fieldset, $settings, $settingsPrev) {
-		if($fieldset && $settingsPrev) {} // ignore
-		$settings = parent::___processUserSettingsInputfields($user, $fieldset, $settings, $settingsPrev); 
 		
-		if($settings['conf_code']) { 
+		if($fieldset && $settingsPrev) {} // ignore
+		
+		$settings = parent::___processUserSettingsInputfields($user, $fieldset, $settings, $settingsPrev); 
+		$emailType = isset($settings['email_type']) ? $settings['email_type'] : 'custom';
+		$userEmail = $user->get($this->emailField);
+		
+		if($emailType === 'current' && $userEmail) {
+			// use current email from field (indicated by value 'e')
+			$settings['code_email'] = 'e';
+		} else {
+			// use custom email address
+		}
+		
+		if(!empty($settings['conf_code'])) { 
 			$valid = $this->isValidUserCode($user, $settings['conf_code'], $settings);
 			if($valid) {
 				$settings['conf_email'] = $settings['code_email'];
-				$this->message($this->_('Thank you, your email address has been confirmed'));
+				$this->message($this->_('Thank you, your email address has been confirmed'), Notice::noGroup);
 			} else if($valid === 0) {
-				$this->error($this->_('You entered an expired code.'));
+				$this->error($this->_('You entered an expired code.'), Notice::noGroup);
 			} else {
-				$this->error($this->_('Invalid confirmation code, please try again')); 
+				$this->error($this->_('Invalid confirmation code, please try again'), Notice::noGroup); 
 			}
 			$settings['conf_code'] = '';
 		} else if($settings['code_email'] && $settings['conf_email'] != $settings['code_email']) {
-			$code = $this->generateCode();
-			$this->emailCode($settings['code_email'], $code);
+			$code = $this->getNewCode();
+			$email = $settings['code_email'] === 'e' ? $userEmail : $settings['code_email'];
+			$this->emailCode($email, $code);
 		}
-
+		
+		return $settings;
+	}
+	
+	public function ___processUserEnabledInputfields(User $user, InputfieldWrapper $fieldset, $settings, $settingsPrev) {
+		$settings = parent::___processUserEnabledInputfields($user, $fieldset, $settings, $settingsPrev);
 		return $settings;
 	}
 	
@@ -228,12 +435,28 @@ class TfaEmail extends Tfa implements Module, ConfigurableModule {
 	}
 
 	/**
+	 * Save TFA data for given user to user_tfa field
+	 *
+	 * @param User $user
+	 * @param array $settings
+	 * @return bool
+	 * @throws WireException
+	 *
+	 */
+	public function saveUserSettings(User $user, array $settings) {
+		unset($settings['email_type']); // we don't need this to be saved
+		unset($settings['conf_code']); 
+		return parent::saveUserSettings($user, $settings);
+	}
+
+	/**
 	 * Module configuration
 	 *
 	 * @param InputfieldWrapper $inputfields
 	 *
 	 */
 	public function getModuleConfigInputfields(InputfieldWrapper $inputfields) {
+
 		$inputfields->new('integer', 'codeLength', $this->_('Authentication code length'))
 			->val($this->codeLength)
 			->columnWidth(50);
@@ -243,5 +466,30 @@ class TfaEmail extends Tfa implements Module, ConfigurableModule {
 		$inputfields->new('email', 'emailFrom', $this->_('From address for emailed codes'))
 			->val($this->emailFrom)
 			->notes($this->_('Placeholder “processwire.com” is automatically replaced with actual HTTP host at runtime.'));
+		
+		$mailer = $this->wire('mail')->new();
+		$mailerName = $mailer ? $mailer->className() : 'WireMail';
+		
+		/** @var InputfieldRadios $f */
+		$f = $this->modules->get('InputfieldRadios');
+		$f->attr('name', 'wireMailer');
+		$f->label = $this->_('Email send method');
+		$f->addOption('',
+			$this->_('Auto-select:') . ' ' .
+			'[span.detail]' . sprintf($this->_('Currently %s'), $mailerName) . '[/span]'
+		);
+		$f->addOption('WireMail',
+			$this->_('PHP mail():') . ' ' .
+			'[span.detail]'  . $this->_('base WireMail') . '[/span]'
+		);
+		foreach($this->modules->findByPrefix('WireMail') as $wireMailerName) {
+			$info = $this->modules->getModuleInfoVerbose($wireMailerName);
+			$label = str_replace('WireMail', '', $wireMailerName);
+			$f->addOption($wireMailerName, "$label: [span.detail] $info[summary] [/span]");
+		}
+		$f->notes = sprintf($this->_('For more options install [WireMail modules](%s).'), 'https://modules.processwire.com/search/?q=WireMail');
+		$f->attr('value', $this->wireMailer);
+		$inputfields->add($f);
+
 	}
 }
